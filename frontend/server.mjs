@@ -19,6 +19,7 @@ const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:8000";
 const SDK_KEY = process.env.LD_SDK_KEY;
 
 export const BACKEND_STATUS_FLAG = "enable-backend-status";
+export const BEACON_PATH = "/api/backend-status-beacon";
 
 let _ldClient;
 
@@ -53,18 +54,41 @@ async function variation(client, key, defaultValue = "control") {
   }
 }
 
+function track(client, eventKey, metricValue) {
+  if (!client) return;
+  try {
+    client.track(eventKey, ldContext(), undefined, metricValue);
+  } catch {
+    // Telemetry must never fail a request.
+  }
+}
+
 export function renderPage({ showBackendStatus }) {
   const backendStatusMarkup = showBackendStatus
     ? `\n  <p id="backend-status">Checking backend status…</p>`
     : "";
 
+  // The status check runs in the browser, so its outcome is beaconed back to
+  // this server, which is where the LaunchDarkly SDK can attribute it to the
+  // flag variation. sendBeacon is fire-and-forget and never blocks the page.
   const backendStatusScript = showBackendStatus
     ? `
-    fetch("${BACKEND_URL}/api/status")
-      .then(r => r.json())
-      .then(d => { document.getElementById("backend-status").textContent =
-        "Backend online: " + d.service + " version " + d.version; })
-      .catch(() => { document.getElementById("backend-status").textContent = "Backend offline"; });`
+    (function () {
+      var started = Date.now();
+      var el = document.getElementById("backend-status");
+      function report(ok) {
+        try {
+          navigator.sendBeacon("${BEACON_PATH}", new Blob(
+            [JSON.stringify({ ok: ok, durationMs: Date.now() - started })],
+            { type: "application/json" }));
+        } catch (e) {}
+      }
+      fetch("${BACKEND_URL}/api/status")
+        .then(r => r.json())
+        .then(d => { el.textContent =
+          "Backend online: " + d.service + " version " + d.version; report(true); })
+        .catch(() => { el.textContent = "Backend offline"; report(false); });
+    })();`
     : "";
 
   return `<!doctype html>
@@ -94,6 +118,21 @@ export function createApp({ ldClient = defaultLdClient() } = {}) {
     const showBackendStatus =
       (await variation(ldClient, BACKEND_STATUS_FLAG)) === "v1";
     res.type("html").send(renderPage({ showBackendStatus }));
+  });
+
+  // Guarded-release telemetry for enable-backend-status. Only the v1 page
+  // beacons here; the route is inert for control traffic.
+  app.post(BEACON_PATH, express.json(), (req, res) => {
+    const { ok, durationMs } = req.body ?? {};
+    if (ok === true) {
+      track(ldClient, "enable-backend-status-success");
+    } else {
+      track(ldClient, "enable-backend-status-error");
+    }
+    if (Number.isFinite(durationMs)) {
+      track(ldClient, "enable-backend-status-latency", durationMs);
+    }
+    res.status(204).end();
   });
 
   return app;
